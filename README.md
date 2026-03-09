@@ -42,72 +42,63 @@ mcp2cli --mcp https://mcp.example.com/sse echo --message "hello"
 
 We measured this. Not estimates — actual token counts using the cl100k_base tokenizer against real schemas, verified by [an automated test suite](tests/test_token_savings.py).
 
-### Per-turn cost
+### What mcp2cli actually costs
 
-Every turn, the native approach injects all tool schemas into the system prompt. mcp2cli injects a single 67-token instruction.
+Let's be upfront about what mcp2cli adds to context. It's not zero — it's just dramatically less than injecting full schemas.
 
-**MCP servers** — native cost scales at ~121 tokens per tool:
+| Component | Cost | When |
+|---|--:|---|
+| System prompt | 67 tokens | Every turn (fixed) |
+| `--list` output | ~16 tokens/tool | Once per conversation |
+| `--help` output | ~80-200 tokens/tool | Once per unique tool used |
+| Tool call output | same as native | Per call |
 
-| Scenario | Native (tokens/turn) | mcp2cli (tokens/turn) | Reduction |
-|---|--:|--:|--:|
-| Small MCP server (3 tools) | 203 | 67 | **67%** |
-| Task manager (30 tools) | 3,619 | 67 | **98%** |
-| Multi-server setup (60 tools) | 7,238 | 67 | **>99%** |
-| Full platform (120 tools) | 14,476 | 67 | **>99%** |
+The `--list` cost scales linearly with the number of tools — 30 tools costs ~464 tokens, 120 tools costs ~1,850 tokens. This is still 7-8x cheaper than the full schemas, and you only pay it once.
 
-**OpenAPI specs** — native cost scales at ~72 tokens per endpoint:
-
-| Scenario | Native (tokens/turn) | mcp2cli (tokens/turn) | Reduction |
-|---|--:|--:|--:|
-| Petstore API (5 endpoints) | 358 | 67 | **81%** |
-| Medium API (20 endpoints) | 1,430 | 67 | **95%** |
-| Large API (50 endpoints) | 3,579 | 67 | **98%** |
-| Enterprise API (200 endpoints) | 14,316 | 67 | **>99%** |
-
-MCP tools are heavier than OpenAPI endpoints because they carry full `inputSchema` with inline descriptions and enums. Either way, mcp2cli's cost is fixed.
+Compare that to native MCP injection: **~121 tokens per tool, every single turn**, whether the model uses those tools or not. For OpenAPI endpoints, it's ~72 tokens per endpoint per turn.
 
 ### Over a full conversation
 
-The savings compound. Here's the total token cost across a realistic multi-turn conversation, including the one-time discovery cost (`--list`) and tool call outputs:
+Here's the total token cost across a realistic multi-turn conversation. The mcp2cli column includes all overhead: the system prompt on every turn, one `--list` discovery, `--help` for each unique tool the LLM actually uses, and tool call outputs.
 
 **MCP servers:**
 
-| Scenario | Turns | Tool calls | Native total | mcp2cli total | Saved |
+| Scenario | Turns | Unique tools used | Native total | mcp2cli total | Saved |
 |---|--:|--:|--:|--:|--:|
-| Task manager (30 tools) | 15 | 8 | 54,525 | 1,709 | **97%** |
-| Multi-server (80 tools) | 20 | 12 | 193,360 | 2,100 | **99%** |
-| Full platform (120 tools) | 25 | 15 | 362,350 | 2,725 | **99%** |
+| Task manager (30 tools) | 15 | 5 | 54,525 | 2,309 | **96%** |
+| Multi-server (80 tools) | 20 | 8 | 193,360 | 3,897 | **98%** |
+| Full platform (120 tools) | 25 | 10 | 362,350 | 5,181 | **99%** |
 
 **OpenAPI specs:**
 
-| Scenario | Turns | Tool calls | Native total | mcp2cli total | Saved |
+| Scenario | Turns | Unique endpoints used | Native total | mcp2cli total | Saved |
 |---|--:|--:|--:|--:|--:|
-| Petstore (5 endpoints) | 10 | 5 | 3,730 | 839 | **77%** |
-| Medium API (20 endpoints) | 15 | 8 | 21,720 | 1,305 | **94%** |
-| Large API (50 endpoints) | 20 | 12 | 71,940 | 1,850 | **97%** |
-| Enterprise API (200 endpoints) | 25 | 15 | 358,425 | 2,725 | **99%** |
+| Petstore (5 endpoints) | 10 | 3 | 3,730 | 1,199 | **68%** |
+| Medium API (20 endpoints) | 15 | 5 | 21,720 | 1,905 | **91%** |
+| Large API (50 endpoints) | 20 | 8 | 71,940 | 2,810 | **96%** |
+| Enterprise API (200 endpoints) | 25 | 10 | 358,425 | 3,925 | **99%** |
 
-A 120-tool MCP platform over 25 turns: **359,625 tokens saved**. The story is the same for a 200-endpoint API: **355,700 tokens saved**.
+A 120-tool MCP platform over 25 turns: **357,169 tokens saved**.
 
 ### Turn-by-turn: watching the gap widen
 
-Here's a 30-tool MCP server over 10 turns. The native approach bleeds tokens on every turn; mcp2cli's cost barely moves.
+Here's a 30-tool MCP server over 10 turns. The mcp2cli column includes the real costs: `--list` discovery on turn 1, `--help` + tool output when each new tool is first used.
 
 ```
 Turn   Native       mcp2cli      Savings
-──────────────────────────────────────────
-1      3,619        217          3,402       ← mcp2cli: discovery (--list)
-2      7,238        284          6,954
-3      10,887       381          10,506      ← tool call
-4      14,506       448          14,058
-5      18,155       545          17,610      ← tool call
-6      21,774       612          21,162
-7      25,423       709          24,714      ← tool call
-8      29,042       776          28,266
-9      32,691       873          31,818      ← tool call
-10     36,310       940          35,370
+──────────────────────────────────────────────────────────
+1      3,619        531          3,088       ← --list (464 tokens)
+2      7,238        598          6,640
+3      10,887       815          10,072      ← --help (120) + tool call
+4      14,506       882          13,624
+5      18,155       1,099        17,056      ← --help (120) + tool call
+6      21,774       1,166        20,608
+7      25,423       1,383        24,040      ← --help (120) + tool call
+8      29,042       1,450        27,592
+9      32,691       1,667        31,024      ← --help (120) + tool call
+10     36,310       1,734        34,576
 
-Total: 35,370 tokens saved (97.4%)
+Total: 34,576 tokens saved (95.2%)
 ```
 
 ### Why the gap is so large
@@ -122,17 +113,21 @@ System prompt: "You have these 30 tools: [3,619 tokens of JSON schemas]"
 **mcp2cli approach** — pay only for what you use:
 ```
 System prompt: "Use mcp2cli --mcp <url> <command> [--flags]"   (67 tokens/turn)
-  → mcp2cli --mcp <url> --list                                (~150 tokens, once)
-  → mcp2cli --mcp <url> create-task --help                     (~80 tokens, once)
-  → mcp2cli --mcp <url> create-task --title "Fix bug"          (0 extra tokens)
-  → 10 turns = 940 tokens
+  → mcp2cli --mcp <url> --list                                (464 tokens, once)
+  → mcp2cli --mcp <url> create-task --help                    (120 tokens, once per tool)
+  → mcp2cli --mcp <url> create-task --title "Fix bug"         (0 extra tokens)
+  → 10 turns, 4 unique tools = 1,734 tokens
 ```
 
 The LLM discovers what it needs, when it needs it. Everything else stays out of context.
 
 ### The multi-server problem
 
-This is where it really hurts. Connect 3 MCP servers (a task manager, a filesystem server, and a database server — 60 tools total) and you're paying 7,238 tokens per turn. Over a 20-turn conversation, that's **145,060 tokens** just for tool schemas. mcp2cli reduces that to **1,940 tokens** — a **98.7% reduction**.
+This is where it really hurts. Connect 3 MCP servers (a task manager, a filesystem server, and a database server — 60 tools total) and you're paying 7,238 tokens per turn. Over a 20-turn conversation, that's **145,060 tokens** just for tool schemas. mcp2cli reduces that to **3,288 tokens** — a **97.7% reduction** — even after accounting for `--list` discovery (928 tokens) and `--help` for 6 unique tools (720 tokens).
+
+### A note on MCP's built-in discovery
+
+MCP does define a [dynamic tool discovery mechanism](https://modelcontextprotocol.info/docs/concepts/tools/#tool-discovery-and-updates) via `notifications/tools/list_changed`. In theory, this lets clients react to tool changes without re-listing. In practice, the initial `tools/list` response still returns all schemas at once (the full ~121 tokens/tool cost), most clients inject those schemas into every turn, and server-side change notifications are rarely implemented. mcp2cli sidesteps this entirely by never injecting schemas — it returns compact `--list` summaries (~16 tokens/tool) and defers full parameter details to on-demand `--help` calls.
 
 ## Install
 
