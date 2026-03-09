@@ -1,6 +1,6 @@
 [project]
 name = "mcp2cli"
-version = "0.0.1"
+version = "1.0.0"
 description = "Turn any MCP server or OpenAPI spec into a CLI"
 readme = "README.md"
 license = "MIT"
@@ -16,6 +16,10 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
 test = ["pytest", "pytest-asyncio", "mcp>=1.0", "tiktoken"]
+
+[project.urls]
+Homepage = "https://github.com/knowsuchagency/mcp2cli"
+Repository = "https://github.com/knowsuchagency/mcp2cli"
 
 [project.scripts]
 mcp2cli = "mcp2cli:main"
