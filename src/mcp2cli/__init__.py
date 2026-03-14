@@ -61,6 +61,10 @@ class CommandDef:
     path: str | None = None
     # MCP
     tool_name: str | None = None
+    # GraphQL
+    graphql_operation_type: str | None = None  # "query" or "mutation"
+    graphql_field_name: str | None = None      # original field name pre-kebab
+    graphql_return_type: dict | None = None    # return type info for selection set
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +642,467 @@ def extract_mcp_commands(tools: list[dict]) -> list[CommandDef]:
 
 
 # ---------------------------------------------------------------------------
+# GraphQL support
+# ---------------------------------------------------------------------------
+
+GRAPHQL_INTROSPECTION_QUERY = """
+query IntrospectionQuery {
+  __schema {
+    queryType { name }
+    mutationType { name }
+    types {
+      kind
+      name
+      fields(includeDeprecated: false) {
+        name
+        description
+        args {
+          name
+          description
+          type {
+            ...TypeRef
+          }
+          defaultValue
+        }
+        type {
+          ...TypeRef
+        }
+      }
+      inputFields {
+        name
+        description
+        type {
+          ...TypeRef
+        }
+        defaultValue
+      }
+      enumValues(includeDeprecated: false) {
+        name
+        description
+      }
+    }
+  }
+}
+
+fragment TypeRef on __Type {
+  kind
+  name
+  ofType {
+    kind
+    name
+    ofType {
+      kind
+      name
+      ofType {
+        kind
+        name
+        ofType {
+          kind
+          name
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _unwrap_type(type_ref: dict) -> tuple[dict, bool, bool]:
+    """Unwrap NON_NULL/LIST wrappers to find the underlying named type.
+
+    Returns (named_type_dict, is_non_null, is_list).
+    """
+    is_non_null = False
+    is_list = False
+    t = type_ref
+    while t:
+        kind = t.get("kind")
+        if kind == "NON_NULL":
+            is_non_null = True
+            t = t.get("ofType", {})
+        elif kind == "LIST":
+            is_list = True
+            t = t.get("ofType", {})
+        else:
+            return t, is_non_null, is_list
+    return type_ref, is_non_null, is_list
+
+
+def _graphql_type_string(type_ref: dict) -> str:
+    """Reconstruct GraphQL type notation from introspection type ref.
+
+    E.g. ``"[String!]!"`` or ``"ID!"`` or ``"Int"``.
+    """
+    kind = type_ref.get("kind")
+    if kind == "NON_NULL":
+        inner = _graphql_type_string(type_ref.get("ofType", {}))
+        return f"{inner}!"
+    if kind == "LIST":
+        inner = _graphql_type_string(type_ref.get("ofType", {}))
+        return f"[{inner}]"
+    return type_ref.get("name", "String")
+
+
+def graphql_type_to_python(
+    type_ref: dict, types_by_name: dict
+) -> tuple[type | None, bool, list | None]:
+    """Map a GraphQL introspection type to (python_type, required, choices).
+
+    - Scalars → str/int/float/None(bool)
+    - Enums → str with choices
+    - Input objects → str (JSON)
+    - Lists → str (JSON array or comma-delimited)
+    """
+    named, is_non_null, is_list = _unwrap_type(type_ref)
+    type_name = named.get("name", "")
+    type_kind = named.get("kind", "")
+
+    if is_list:
+        return str, is_non_null, None
+
+    if type_kind == "ENUM":
+        enum_type = types_by_name.get(type_name, {})
+        choices = [ev["name"] for ev in enum_type.get("enumValues", [])]
+        return str, is_non_null, choices or None
+
+    if type_kind == "INPUT_OBJECT":
+        return str, is_non_null, None
+
+    # Scalars
+    scalar_map = {
+        "String": str,
+        "ID": str,
+        "Int": int,
+        "Float": float,
+        "Boolean": None,  # store_true
+    }
+    py_type = scalar_map.get(type_name, str)
+    return py_type, is_non_null, None
+
+
+def _build_selection_set(
+    type_ref: dict, types_by_name: dict, depth: int = 2, seen: set | None = None
+) -> str:
+    """Auto-generate a GraphQL selection set from a return type.
+
+    Depth 2 = scalar fields + one level of nested object scalar fields.
+    """
+    if seen is None:
+        seen = set()
+
+    named, _, is_list = _unwrap_type(type_ref)
+    type_name = named.get("name", "")
+    type_kind = named.get("kind", "")
+
+    # Scalar / enum — no selection needed
+    if type_kind in ("SCALAR", "ENUM"):
+        return ""
+
+    if type_name in seen or depth <= 0:
+        return ""
+
+    type_def = types_by_name.get(type_name, {})
+    fields = type_def.get("fields", [])
+    if not fields:
+        return ""
+
+    seen = seen | {type_name}
+    parts = []
+    for f in fields:
+        f_named, _, _ = _unwrap_type(f["type"])
+        f_kind = f_named.get("kind", "")
+        if f_kind in ("SCALAR", "ENUM"):
+            parts.append(f["name"])
+        elif f_kind == "OBJECT" and depth > 1:
+            nested = _build_selection_set(f["type"], types_by_name, depth - 1, seen)
+            if nested:
+                parts.append(f"{f['name']} {nested}")
+    if not parts:
+        return ""
+    return "{ " + " ".join(parts) + " }"
+
+
+def load_graphql_schema(
+    url: str,
+    auth_headers: list[tuple[str, str]],
+    cache_key: str | None,
+    ttl: int,
+    refresh: bool,
+) -> dict:
+    """POST introspection query to a GraphQL endpoint, with caching."""
+    key = cache_key or cache_key_for(f"graphql:{url}")
+    if not refresh:
+        cached = load_cached(key, ttl)
+        if cached is not None:
+            return cached
+
+    headers = dict(auth_headers)
+    headers.setdefault("Content-Type", "application/json")
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(
+            url,
+            headers=headers,
+            json={"query": GRAPHQL_INTROSPECTION_QUERY},
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+    if "errors" in result and not result.get("data"):
+        msgs = "; ".join(e.get("message", "") for e in result["errors"])
+        print(f"Error: GraphQL introspection failed: {msgs}", file=sys.stderr)
+        sys.exit(1)
+
+    schema = result.get("data", {}).get("__schema", {})
+    if not schema:
+        print("Error: introspection returned no schema", file=sys.stderr)
+        sys.exit(1)
+
+    save_cache(key, schema)
+    return schema
+
+
+def extract_graphql_commands(schema: dict) -> list[CommandDef]:
+    """Convert introspection schema into CommandDef list."""
+    types_by_name = {t["name"]: t for t in schema.get("types", []) if t.get("name")}
+
+    query_type_name = (schema.get("queryType") or {}).get("name")
+    mutation_type_name = (schema.get("mutationType") or {}).get("name")
+
+    commands: list[CommandDef] = []
+    seen_names: set[str] = set()
+
+    # Collect field names to detect collisions
+    query_fields = types_by_name.get(query_type_name, {}).get("fields", []) if query_type_name else []
+    mutation_fields = types_by_name.get(mutation_type_name, {}).get("fields", []) if mutation_type_name else []
+    all_field_names = set()
+    collisions = set()
+    for f in query_fields + mutation_fields:
+        n = f["name"]
+        if n in all_field_names:
+            collisions.add(n)
+        all_field_names.add(n)
+
+    for op_type, type_name, fields in [
+        ("query", query_type_name, query_fields),
+        ("mutation", mutation_type_name, mutation_fields),
+    ]:
+        for field_def in fields:
+            field_name = field_def["name"]
+            # Skip introspection fields
+            if field_name.startswith("__"):
+                continue
+
+            cli_name = to_kebab(field_name)
+            if field_name in collisions:
+                cli_name = f"{op_type}-{cli_name}"
+
+            # Deduplicate
+            if cli_name in seen_names:
+                cli_name = f"{op_type}-{cli_name}"
+            seen_names.add(cli_name)
+
+            desc = field_def.get("description") or f"{op_type} {field_name}"
+
+            params: list[ParamDef] = []
+            for arg in field_def.get("args", []):
+                py_type, required, choices = graphql_type_to_python(
+                    arg["type"], types_by_name
+                )
+                gql_type_str = _graphql_type_string(arg["type"])
+                named_t, _, is_list = _unwrap_type(arg["type"])
+
+                # Build schema for coerce_value
+                param_schema: dict = {"graphql_type": gql_type_str}
+                if is_list:
+                    param_schema["type"] = "array"
+                    # Determine item type
+                    inner_named, _, _ = _unwrap_type(named_t)
+                    item_type_name = inner_named.get("name", "String")
+                    item_map = {"Int": "integer", "Float": "number", "String": "string", "ID": "string", "Boolean": "boolean"}
+                    param_schema["items"] = {"type": item_map.get(item_type_name, "string")}
+                elif named_t.get("kind") == "INPUT_OBJECT":
+                    param_schema["type"] = "object"
+                elif named_t.get("kind") == "ENUM":
+                    param_schema["type"] = "string"
+
+                arg_desc = arg.get("description") or arg["name"]
+                if is_list:
+                    arg_desc += " (JSON array)"
+                elif named_t.get("kind") == "INPUT_OBJECT":
+                    arg_desc += " (JSON object)"
+
+                params.append(
+                    ParamDef(
+                        name=to_kebab(arg["name"]),
+                        original_name=arg["name"],
+                        python_type=py_type,
+                        required=required,
+                        description=arg_desc,
+                        choices=choices,
+                        location="graphql_arg",
+                        schema=param_schema,
+                    )
+                )
+
+            commands.append(
+                CommandDef(
+                    name=cli_name,
+                    description=desc,
+                    params=params,
+                    has_body=bool(params),
+                    graphql_operation_type=op_type,
+                    graphql_field_name=field_name,
+                    graphql_return_type=field_def.get("type"),
+                )
+            )
+
+    return commands
+
+
+def list_graphql_commands(commands: list[CommandDef]):
+    """Group commands by operation type and print."""
+    groups: dict[str, list[CommandDef]] = {}
+    for cmd in commands:
+        key = cmd.graphql_operation_type or "other"
+        groups.setdefault(key, []).append(cmd)
+
+    for group in ["query", "mutation"]:
+        cmds = groups.get(group, [])
+        if not cmds:
+            continue
+        label = "queries" if group == "query" else "mutations"
+        print(f"\n{label}:")
+        for cmd in cmds:
+            desc = f"  {cmd.description[:60]}" if cmd.description else ""
+            print(f"  {cmd.name:<40}{desc}")
+
+
+def execute_graphql(
+    args: argparse.Namespace,
+    cmd: CommandDef,
+    url: str,
+    schema: dict,
+    auth_headers: list[tuple[str, str]],
+    pretty: bool,
+    raw: bool,
+    toon: bool = False,
+    fields_override: str | None = None,
+):
+    """Build and execute a GraphQL query/mutation."""
+    types_by_name = {t["name"]: t for t in schema.get("types", []) if t.get("name")}
+
+    # Build variables dict from args
+    if getattr(args, "stdin", False):
+        variables = read_stdin_json("GraphQL variables")
+    else:
+        variables = {}
+        for p in cmd.params:
+            val = getattr(args, p.name.replace("-", "_"), None)
+            if val is not None:
+                variables[p.original_name] = coerce_value(val, p.schema)
+
+    # Build variable declarations for the document
+    var_decls = []
+    for p in cmd.params:
+        if p.original_name in variables:
+            gql_type = p.schema.get("graphql_type", "String")
+            var_decls.append(f"${p.original_name}: {gql_type}")
+
+    # Build selection set
+    if fields_override:
+        selection = f"{{ {fields_override} }}"
+    elif cmd.graphql_return_type:
+        selection = _build_selection_set(cmd.graphql_return_type, types_by_name)
+    else:
+        selection = ""
+
+    # Build argument list for the field
+    field_args = []
+    for p in cmd.params:
+        if p.original_name in variables:
+            field_args.append(f"{p.original_name}: ${p.original_name}")
+
+    field_name = cmd.graphql_field_name or cmd.name
+    args_str = f"({', '.join(field_args)})" if field_args else ""
+    op_type = cmd.graphql_operation_type or "query"
+    var_decls_str = f"({', '.join(var_decls)})" if var_decls else ""
+
+    document = f"{op_type}{var_decls_str} {{ {field_name}{args_str} {selection} }}"
+
+    headers = dict(auth_headers)
+    headers.setdefault("Content-Type", "application/json")
+
+    with httpx.Client(timeout=60) as client:
+        resp = client.post(
+            url,
+            headers=headers,
+            json={"query": document, "variables": variables or None},
+        )
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+            sys.exit(1)
+
+    result = resp.json()
+    if "errors" in result:
+        if not result.get("data"):
+            msgs = "; ".join(e.get("message", "") for e in result["errors"])
+            print(f"GraphQL error: {msgs}", file=sys.stderr)
+            sys.exit(1)
+        # Partial errors — include them in output
+        output_result(result, pretty=pretty, raw=raw, toon=toon)
+        return
+
+    data = result.get("data", {})
+    # Extract the specific field's data
+    field_data = data.get(field_name, data)
+    output_result(field_data, pretty=pretty, raw=raw, toon=toon)
+
+
+def handle_graphql(
+    url: str,
+    auth_headers: list[tuple[str, str]],
+    remaining: list[str],
+    list_mode: bool,
+    pretty: bool,
+    raw: bool,
+    cache_key: str | None,
+    ttl: int,
+    refresh: bool,
+    toon: bool = False,
+    fields_override: str | None = None,
+):
+    """Top-level handler for --graphql mode."""
+    schema = load_graphql_schema(url, auth_headers, cache_key, ttl, refresh)
+    commands = extract_graphql_commands(schema)
+
+    if list_mode:
+        list_graphql_commands(commands)
+        return
+
+    if not remaining:
+        print("Available operations:")
+        list_graphql_commands(commands)
+        print("\nUse --list for the same output, or provide a subcommand.")
+        return
+
+    pre_for_gql = argparse.ArgumentParser(add_help=False)
+    parser = build_argparse(commands, pre_for_gql)
+    args = parser.parse_args(remaining)
+
+    if not hasattr(args, "_cmd"):
+        parser.print_help()
+        sys.exit(1)
+
+    cmd: CommandDef = args._cmd
+    execute_graphql(
+        args, cmd, url, schema, auth_headers, pretty, raw, toon=toon,
+        fields_override=fields_override,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI builder
 # ---------------------------------------------------------------------------
 
@@ -679,7 +1144,7 @@ def build_argparse(
             if (
                 p.required
                 and "action" not in kwargs
-                and p.location not in ("body", "tool_input")
+                and p.location not in ("body", "tool_input", "graphql_arg")
             ):
                 kwargs["required"] = True
             else:
@@ -1874,6 +2339,7 @@ def main():
     pre.add_argument("--spec", default=None, help="OpenAPI spec URL or file path")
     pre.add_argument("--mcp", default=None, help="MCP server URL (HTTP/SSE)")
     pre.add_argument("--mcp-stdio", default=None, help="MCP server command (stdio)")
+    pre.add_argument("--graphql", default=None, help="GraphQL endpoint URL")
     pre.add_argument(
         "--auth-header",
         action="append",
@@ -1910,6 +2376,11 @@ def main():
             "list-users) and 15-20%% for semi-uniform data. Best for LLM consumption "
             "of large result sets. Requires @toon-format/cli (npm install -g @toon-format/cli)."
         ),
+    )
+    pre.add_argument(
+        "--fields",
+        default=None,
+        help="Override auto-generated GraphQL selection set fields (e.g. 'id name email')",
     )
     pre.add_argument(
         "--transport",
@@ -2028,7 +2499,7 @@ def main():
     )
 
     # Validate mutual exclusivity
-    modes = [pre_args.spec, pre_args.mcp, pre_args.mcp_stdio]
+    modes = [pre_args.spec, pre_args.mcp, pre_args.mcp_stdio, pre_args.graphql]
     active = sum(1 for m in modes if m is not None)
     if needs_source:
         if active == 0:
@@ -2036,13 +2507,13 @@ def main():
             if "-h" in remaining or "--help" in remaining:
                 sys.exit(0)
             print(
-                "\nError: one of --spec, --mcp, or --mcp-stdio is required.",
+                "\nError: one of --spec, --mcp, --mcp-stdio, or --graphql is required.",
                 file=sys.stderr,
             )
             sys.exit(1)
     if active > 1:
         print(
-            "Error: --spec, --mcp, and --mcp-stdio are mutually exclusive.",
+            "Error: --spec, --mcp, --mcp-stdio, and --graphql are mutually exclusive.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2249,6 +2720,23 @@ def main():
             if "=" in pa:
                 k, v = pa.split("=", 1)
                 prompt_arguments[k] = v
+
+    # --- GraphQL mode ---
+    if pre_args.graphql:
+        handle_graphql(
+            pre_args.graphql,
+            auth_headers,
+            remaining,
+            pre_args.list_commands,
+            pre_args.pretty,
+            pre_args.raw,
+            pre_args.cache_key,
+            pre_args.cache_ttl,
+            pre_args.refresh,
+            toon=pre_args.toon,
+            fields_override=pre_args.fields,
+        )
+        return
 
     # --- MCP modes ---
     if pre_args.mcp or pre_args.mcp_stdio:
