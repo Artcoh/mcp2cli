@@ -238,6 +238,7 @@ mcp2cli bake show petstore                # show config (secrets masked)
 mcp2cli bake update petstore --cache-ttl 3600
 mcp2cli bake remove petstore
 mcp2cli bake install petstore             # creates ~/.local/bin/petstore wrapper
+mcp2cli bake install petstore --dir ./scripts/  # install wrapper to custom directory
 ```
 
 Filtering options:

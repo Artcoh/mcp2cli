@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import argparse
 import copy
@@ -1419,12 +1419,13 @@ def _bake_update(argv: list[str]) -> None:
 def _bake_install(argv: list[str]) -> None:
     p = argparse.ArgumentParser(prog="mcp2cli bake install")
     p.add_argument("name")
+    p.add_argument("--dir", default=None, help="Directory to install wrapper into (default: ~/.local/bin)")
     args = p.parse_args(argv)
     cfg = _load_baked(args.name)
     if cfg is None:
         print(f"Error: no baked tool named '{args.name}'", file=sys.stderr)
         sys.exit(1)
-    bin_dir = Path.home() / ".local" / "bin"
+    bin_dir = Path(args.dir) if args.dir else Path.home() / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     wrapper = bin_dir / args.name
     # Resolve mcp2cli path
@@ -1434,7 +1435,7 @@ def _bake_install(argv: list[str]) -> None:
     )
     wrapper.chmod(0o755)
     print(f"Installed wrapper: {wrapper}")
-    if str(bin_dir) not in os.environ.get("PATH", ""):
+    if args.dir is None and str(bin_dir) not in os.environ.get("PATH", ""):
         print(f"  Note: {bin_dir} may not be in your PATH")
 
 

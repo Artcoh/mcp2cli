@@ -446,3 +446,40 @@ class TestBakeInstall:
         assert "@inst-test" in content
         # Clean up
         wrapper.unlink()
+
+    def test_install_custom_dir(self, tmp_path):
+        cfg_dir = tmp_path / "config"
+        cache_dir = tmp_path / "cache"
+        custom_dir = tmp_path / "custom_bin"
+        _run(
+            "bake", "create", "dir-test",
+            "--mcp-stdio", f"{sys.executable} {MCP_SERVER}",
+            config_dir=cfg_dir, cache_dir=cache_dir,
+        )
+        r = _run(
+            "bake", "install", "dir-test", "--dir", str(custom_dir),
+            config_dir=cfg_dir, cache_dir=cache_dir,
+        )
+        assert r.returncode == 0
+        assert "Installed wrapper" in r.stdout
+        wrapper = custom_dir / "dir-test"
+        assert wrapper.exists()
+        content = wrapper.read_text()
+        assert "@dir-test" in content
+        assert wrapper.stat().st_mode & 0o755
+
+    def test_install_custom_dir_no_path_warning(self, tmp_path):
+        cfg_dir = tmp_path / "config"
+        cache_dir = tmp_path / "cache"
+        custom_dir = tmp_path / "scripts"
+        _run(
+            "bake", "create", "warn-test",
+            "--mcp-stdio", f"{sys.executable} {MCP_SERVER}",
+            config_dir=cfg_dir, cache_dir=cache_dir,
+        )
+        r = _run(
+            "bake", "install", "warn-test", "--dir", str(custom_dir),
+            config_dir=cfg_dir, cache_dir=cache_dir,
+        )
+        assert r.returncode == 0
+        assert "may not be in your PATH" not in r.stdout

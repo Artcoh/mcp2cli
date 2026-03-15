@@ -242,10 +242,40 @@ When the user asks to create a skill from an MCP server, OpenAPI spec, or GraphQ
    uvx mcp2cli --mcp https://target.example.com/sse <command> --param value
    ```
 
-4. **Create a SKILL.md** that teaches another AI agent how to use this API via mcp2cli. Include:
-   - The source flag (`--mcp`, `--mcp-stdio`, `--spec`, or `--graphql`) and URL
-   - Any required auth headers
-   - Common workflows with example commands
-   - The `--list` and `--help` discovery pattern for commands not covered
+4. **Bake** the connection settings so the skill doesn't need to repeat flags:
+   ```bash
+   uvx mcp2cli bake create myapi \
+     --mcp https://target.example.com/sse \
+     --auth-header "Authorization:Bearer env:MYAPI_TOKEN" \
+     --exclude "delete-*" --methods GET,POST
+   ```
 
-The generated skill should use mcp2cli as its execution layer — the agent runs `uvx mcp2cli ...` commands rather than making raw HTTP/MCP calls.
+5. **Install** the wrapper into the skill's scripts directory:
+   ```bash
+   uvx mcp2cli bake install myapi --dir .claude/skills/myapi/scripts/
+   ```
+
+6. **Create a SKILL.md** in `.claude/skills/myapi/` that teaches another AI agent how to use this API. The SKILL.md should:
+   - Reference the baked wrapper script via `${CLAUDE_SKILL_DIR}/scripts/myapi` instead of raw `uvx mcp2cli ...` commands
+   - Include `allowed-tools: Bash(bash *)` in the frontmatter
+   - Document common workflows with example commands
+   - Include the `--list` and `--help` discovery pattern for commands not covered
+
+   Example SKILL.md structure:
+   ```yaml
+   ---
+   name: myapi
+   description: Interact with the MyAPI service
+   allowed-tools: Bash(bash *)
+   ---
+   ```
+   ```bash
+   # List available commands
+   bash ${CLAUDE_SKILL_DIR}/scripts/myapi --list
+   # Get help for a command
+   bash ${CLAUDE_SKILL_DIR}/scripts/myapi <command> --help
+   # Run a command
+   bash ${CLAUDE_SKILL_DIR}/scripts/myapi <command> --param value --pretty
+   ```
+
+The generated skill uses mcp2cli as its execution layer — the baked wrapper script handles all connection details so the SKILL.md stays clean and portable.
